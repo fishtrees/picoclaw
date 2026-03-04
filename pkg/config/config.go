@@ -587,6 +587,9 @@ type ExecConfig struct {
 	EnableDenyPatterns  bool     `                                 env:"PICOCLAW_TOOLS_EXEC_ENABLE_DENY_PATTERNS"  json:"enable_deny_patterns"`
 	CustomDenyPatterns  []string `                                 env:"PICOCLAW_TOOLS_EXEC_CUSTOM_DENY_PATTERNS"  json:"custom_deny_patterns"`
 	CustomAllowPatterns []string `                                 env:"PICOCLAW_TOOLS_EXEC_CUSTOM_ALLOW_PATTERNS" json:"custom_allow_patterns"`
+	// TimeoutSeconds specifies command execution timeout in seconds.
+	// nil or unset = default 60s, 0 = no timeout, >0 = specified timeout
+	TimeoutSeconds *int `json:"timeout_seconds,omitempty" env:"PICOCLAW_TOOLS_EXEC_TIMEOUT_SECONDS"`
 }
 
 type SkillsToolsConfig struct {
