@@ -101,6 +101,9 @@ func NewExecToolWithConfig(workingDir string, restrict bool, config *config.Conf
 	denyPatterns := make([]*regexp.Regexp, 0)
 	customAllowPatterns := make([]*regexp.Regexp, 0)
 
+	// Default timeout is 60 seconds
+	timeout := 60 * time.Second
+
 	if config != nil {
 		execConfig := config.Tools.Exec
 		enableDenyPatterns := execConfig.EnableDenyPatterns
@@ -126,6 +129,11 @@ func NewExecToolWithConfig(workingDir string, restrict bool, config *config.Conf
 				return nil, fmt.Errorf("invalid custom allow pattern %q: %w", pattern, err)
 			}
 			customAllowPatterns = append(customAllowPatterns, re)
+		}
+		// Apply custom timeout if set
+		// nil = use default (60s), 0 = no timeout, >0 = specified timeout
+		if execConfig.TimeoutSeconds != nil {
+			timeout = time.Duration(*execConfig.TimeoutSeconds) * time.Second
 		}
 	} else {
 		denyPatterns = append(denyPatterns, defaultDenyPatterns...)
