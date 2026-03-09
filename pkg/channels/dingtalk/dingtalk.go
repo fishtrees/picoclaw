@@ -132,10 +132,14 @@ func (c *DingTalkChannel) checkAndRecover() {
 	silenceDuration := time.Since(c.lastMessageTime)
 	c.mu.RUnlock()
 
-	logger.DebugCF("dingtalk", "Health check: silence duration %v", silenceDuration)
+	logger.DebugCF("dingtalk", "Health check: silence duration", map[string]any{"duration": silenceDuration})
 
 	if silenceDuration >= maxSilenceDuration {
-		logger.InfoCF("dingtalk", "Connection appears stale (no messages for %v), triggering recovery", silenceDuration)
+		logger.InfoCF(
+			"dingtalk",
+			"Connection appears stale (no messages for configured duration), triggering recovery",
+			map[string]any{"silenceDuration": silenceDuration},
+		)
 		c.recoverConnection()
 	}
 }
@@ -159,14 +163,18 @@ func (c *DingTalkChannel) recoverConnection() {
 
 		err := c.startStreamClient()
 		if err == nil {
-			logger.InfoCF("dingtalk", "Connection recovered successfully")
+			logger.InfoCF("dingtalk", "Connection recovered successfully", map[string]any{})
 			c.mu.Lock()
 			c.lastMessageTime = time.Now()
 			c.mu.Unlock()
 			return
 		}
 
-		logger.WarnCF("dingtalk", "Recovery failed: %v, retrying in %v", err, recoveryRetryDelay)
+		logger.WarnCF(
+			"dingtalk",
+			"Recovery failed, retrying",
+			map[string]any{"error": err, "retryDelay": recoveryRetryDelay},
+		)
 		time.Sleep(recoveryRetryDelay)
 	}
 }
