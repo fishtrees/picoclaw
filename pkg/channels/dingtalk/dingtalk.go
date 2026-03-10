@@ -6,6 +6,7 @@ package dingtalk
 import (
 	"context"
 	"fmt"
+	"net/http"
 	"sync"
 	"time"
 
@@ -29,6 +30,16 @@ const (
 	recoveryRetryDelay  = 30 * time.Second // Delay before retrying failed recovery
 )
 
+// DingTalkSession stores complete session information for proactive messaging
+type DingTalkSession struct {
+	SessionWebhook            string    `json:"session_webhook"`
+	SessionWebhookExpiredTime int64     `json:"session_webhook_expired_time"` // milliseconds timestamp
+	OpenConversationId        string    `json:"open_conversation_id"`         // Group chat ID
+	SenderStaffId             string    `json:"sender_staff_id"`              // User ID for direct chat
+	ConversationType          string    `json:"conversation_type"`            // "1" = direct, else = group
+	LastUpdated               time.Time `json:"last_updated"`
+}
+
 // DingTalkChannel implements the Channel interface for DingTalk (钉钉)
 // It uses WebSocket for receiving messages via stream mode and API for sending
 type DingTalkChannel struct {
@@ -39,8 +50,13 @@ type DingTalkChannel struct {
 	streamClient *client.StreamClient
 	ctx          context.Context
 	cancel       context.CancelFunc
-	// Map to store session webhooks for each chat
-	sessionWebhooks sync.Map // chatID -> sessionWebhook
+	// Map to store session info for each chat
+	sessions sync.Map // chatID -> *DingTalkSession
+	// Token management for proactive messaging via robot API
+	accessToken string
+	tokenExpiry time.Time
+	tokenMu     sync.RWMutex
+	httpClient  *http.Client
 	// Health monitoring
 	lastMessageTime time.Time
 	mu              sync.RWMutex
@@ -76,6 +92,19 @@ func (c *DingTalkChannel) Start(ctx context.Context) error {
 	c.ctx, c.cancel = context.WithCancel(ctx)
 	c.lastMessageTime = time.Now() // Initialize on start
 
+	// Initialize HTTP client for robot API
+	c.httpClient = &http.Client{Timeout: 30 * time.Second}
+
+	// If proactive send is enabled, get initial token and start refresh loop
+	if c.config.ProactiveSend {
+		if err := c.refreshAccessToken(); err != nil {
+			logger.WarnCF("dingtalk", "Failed to get initial access token, proactive send may not work", map[string]any{
+				"error": err.Error(),
+			})
+		}
+		go c.tokenRefreshLoop()
+	}
+
 	// Start the stream client
 	if err := c.startStreamClient(); err != nil {
 		return err
@@ -85,7 +114,9 @@ func (c *DingTalkChannel) Start(ctx context.Context) error {
 	go c.healthMonitor()
 
 	c.SetRunning(true)
-	logger.InfoC("dingtalk", "DingTalk channel started (Stream Mode)")
+	logger.InfoCF("dingtalk", "DingTalk channel started", map[string]any{
+		"proactive_send": c.config.ProactiveSend,
+	})
 	return nil
 }
 
@@ -203,21 +234,11 @@ func (c *DingTalkChannel) Stop(ctx context.Context) error {
 	return nil
 }
 
-// Send sends a message to DingTalk via the chatbot reply API
+// Send sends a message to DingTalk
+// Priority: 1) session_webhook (if valid), 2) robot API (if proactive_send enabled)
 func (c *DingTalkChannel) Send(ctx context.Context, msg bus.OutboundMessage) error {
 	if !c.IsRunning() {
 		return channels.ErrNotRunning
-	}
-
-	// Get session webhook from storage
-	sessionWebhookRaw, ok := c.sessionWebhooks.Load(msg.ChatID)
-	if !ok {
-		return fmt.Errorf("no session_webhook found for chat %s, cannot send message", msg.ChatID)
-	}
-
-	sessionWebhook, ok := sessionWebhookRaw.(string)
-	if !ok {
-		return fmt.Errorf("invalid session_webhook type for chat %s", msg.ChatID)
 	}
 
 	logger.DebugCF("dingtalk", "Sending message", map[string]any{
@@ -225,8 +246,48 @@ func (c *DingTalkChannel) Send(ctx context.Context, msg bus.OutboundMessage) err
 		"preview": utils.Truncate(msg.Content, 100),
 	})
 
-	// Use the session webhook to send the reply
-	return c.SendDirectReply(ctx, sessionWebhook, msg.Content)
+	// 1. Try session webhook first
+	session := c.getSession(msg.ChatID)
+	if session != nil && c.isSessionWebhookValid(session) {
+		err := c.SendDirectReply(ctx, session.SessionWebhook, msg.Content)
+		if err == nil {
+			return nil
+		}
+		// Session webhook failed, log and try fallback
+		logger.WarnCF("dingtalk", "Session webhook send failed, trying fallback", map[string]any{
+			"error":   err.Error(),
+			"chat_id": msg.ChatID,
+		})
+	}
+
+	// 2. Fallback to robot API if proactive send is enabled
+	if !c.config.ProactiveSend {
+		return fmt.Errorf("no valid session_webhook for chat %s and proactive_send is disabled", msg.ChatID)
+	}
+
+	return c.sendViaRobotAPI(ctx, msg.ChatID, msg.Content)
+}
+
+// getSession retrieves session info for a chat
+func (c *DingTalkChannel) getSession(chatID string) *DingTalkSession {
+	if v, ok := c.sessions.Load(chatID); ok {
+		if session, ok := v.(*DingTalkSession); ok {
+			return session
+		}
+	}
+	return nil
+}
+
+// isSessionWebhookValid checks if the session webhook is still valid
+func (c *DingTalkChannel) isSessionWebhookValid(session *DingTalkSession) bool {
+	if session.SessionWebhook == "" {
+		return false
+	}
+	// Check expiry if available (SessionWebhookExpiredTime is in milliseconds)
+	if session.SessionWebhookExpiredTime > 0 {
+		return time.Now().UnixMilli() < session.SessionWebhookExpiredTime
+	}
+	return true // No expiry info, assume valid
 }
 
 // onChatBotMessageReceived implements the IChatBotMessageHandler function signature
@@ -262,8 +323,16 @@ func (c *DingTalkChannel) onChatBotMessageReceived(
 		chatID = data.ConversationId
 	}
 
-	// Store the session webhook for this chat so we can reply later
-	c.sessionWebhooks.Store(chatID, data.SessionWebhook)
+	// Store complete session info for proactive messaging
+	session := &DingTalkSession{
+		SessionWebhook:            data.SessionWebhook,
+		SessionWebhookExpiredTime: data.SessionWebhookExpiredTime,
+		OpenConversationId:        data.ConversationId,
+		SenderStaffId:             data.SenderStaffId,
+		ConversationType:          data.ConversationType,
+		LastUpdated:               time.Now(),
+	}
+	c.sessions.Store(chatID, session)
 
 	metadata := map[string]string{
 		"sender_name":       senderNick,
