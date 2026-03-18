@@ -48,7 +48,7 @@ type DingTalkChannel struct {
 	accessToken string
 	tokenExpiry time.Time
 	tokenMu     sync.RWMutex
-	httpClient *http.Client
+	httpClient  *http.Client
 }
 
 // NewDingTalkChannel creates a new DingTalk channel instance
